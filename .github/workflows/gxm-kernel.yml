@@ -142,26 +142,39 @@ jobs:
             fi
           done
 
-      - name: 用符号表编外部模块
+      - name: 按依赖顺序编外部模块（符号表逐级串联）
         id: extmod
         run: |
           set -uo pipefail
-          set +e          # 5 个目录都要尝试，失败也要留下日志
+          set +e
           KD="$PWD/work/linux-amlogic-${KC_LINUX}"
           MM="$(ls -d work/media_modules-aml-* | head -1)"
-          for d in common frame_provider frame_sink amvdec_ports stream_input; do
-            make -C "$KD" M="$PWD/$MM/drivers/$d" \
+          MMABS="$PWD/$MM"
+          # 起点：内核自己的导出符号
+          EXTRA="$KD/Module.symvers"
+          # 顺序来自实测的符号归属：
+          #   common    → get_cpu_major_id / get_firmware_data / vdec_clock_*
+          #   frame_provider → vdec_create/init/write_vframe ...
+          #   stream_input   → amports_get_dma_device / stbuf_* / esparser_*
+          #   amvdec_ports   → 依赖以上全部
+          for d in common frame_provider stream_input amvdec_ports frame_sink; do
+            make -C "$KD" M="$MMABS/drivers/$d" \
                  ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-                 KBUILD_EXTRA_SYMBOLS="$KD/Module.symvers" \
+                 KBUILD_EXTRA_SYMBOLS="$EXTRA" \
                  KCFLAGS="$KFLAGS" -k \
                  CONFIG_AMLOGIC_DVB=n \
                  CONFIG_AMLOGIC_MEDIA_VDEC_H264=m CONFIG_AMLOGIC_MEDIA_VDEC_H265=m \
                  CONFIG_AMLOGIC_MEDIA_VDEC_MPEG12=m CONFIG_AMLOGIC_MEDIA_VDEC_VP9=m \
                  > "sym_$d.log" 2>&1
-            echo "[$d] exit=$? errors=$(grep -c ' error: ' "sym_$d.log" || true)"
+            echo "[$d] exit=$? errors=$(grep -c ' error: ' "sym_$d.log") und=$(grep -c 'undefined!' "sym_$d.log")"
+            # 把本目录新产出的符号表加入后续构建
+            for f in $(find "$MMABS/drivers/$d" -name Module.symvers); do
+              EXTRA="$EXTRA $f"
+              echo "    + symvers $(basename "$(dirname "$f")")/Module.symvers ($(wc -l < "$f") 行)"
+            done
           done
-          echo "=== .ko ==="
-          find "$PWD/$MM" -name '*.ko' | sed "s|$PWD/||"
+          echo "=== 产出的 .ko ==="
+          find "$MMABS" -name '*.ko' | sed "s|$MMABS/drivers/||" | sort
 
       - name: 符号解析判定
         run: |
@@ -169,7 +182,7 @@ jobs:
           cat sym_*.log > sym_all.log 2>/dev/null || true
           und=$(grep -c 'undefined!' sym_all.log || true)
           err=$(grep -c ' error: ' sym_all.log || true)
-          ko=$(find work -name '*.ko' | wc -l)
+          ko=$(find work/media_modules-aml-* -name '*.ko' 2>/dev/null | wc -l)
           echo "未解析符号(undefined!): $und"
           echo "编译错误: $err"
           echo ".ko 数量: $ko"
@@ -212,6 +225,7 @@ jobs:
             work/**/*.ko
             work/linux-amlogic-*/arch/arm64/boot/Image
             work/linux-amlogic-*/Module.symvers
+            work/media_modules-*/**/Module.symvers
             sym_*.log
             kernel_build.log
           compression-level: 0
