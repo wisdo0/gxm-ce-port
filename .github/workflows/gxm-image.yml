@@ -1,0 +1,321 @@
+name: gxm-image
+
+# 产出「骨架镜像」：内核 + 私有 amcodec 模块 + 最小 initramfs，用于在真机上回答一个问题——
+#   这 9 个 .ko 到底能不能 probe？/dev/amstream_* 会不会出现？
+#
+# 为什么先做这个而不是直接出 CE 完整镜像：
+#   CE buildroot 全量编 Kodi 在 2 核上要 6-10 小时，撞 GitHub 单 job 6 小时上限。
+#   而「模块能不能加载」是当前最大的未知，用 20 分钟就能验掉，没必要先付 10 小时的代价。
+#
+# 引导链（厂商 u-boot 2015.01，ophub 的 u-boot.sd 已含 BL1/BL2/BL30）：
+#   u-boot → aml_autoscript(mm 0) → setenv bootcmd; saveenv; reboot
+#          → s905_autoscript → fatload uEnv.txt → env import → fatload Image/initrd/dtb → booti
+#
+# 镜像布局：
+#   sector 0        u-boot.sd（保留 MBR 前 442 字节，避免覆盖分区表）
+#   sector 2048     FAT32 p1，含 aml_autoscript / s905_autoscript / uEnv.txt / Image / initrd.img / dtb/
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "gxm-v*"
+
+permissions:
+  contents: write
+
+env:
+  KC_LINUX: amlogic-4.9-20
+  MM_COMMIT: 1af2bb1308f07e060f588761b3ee60398675f5c4
+  HOSTFLAGS: "-fcommon -Wno-error"
+  KFLAGS: "-Wno-error -Wno-incompatible-pointer-types -Wno-int-conversion"
+  IMG_MB: "256"
+  PART_OFFSET: "2048"
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          df -h / | tail -1
+
+      - name: 安装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc bison flex \
+            libssl-dev libncurses-dev unzip mtools device-tree-compiler \
+            rsync xz-utils cpio dosfstools gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu
+          mkfs.vfat --help 2>&1 | grep -q -- '--offset' && echo "mkfs.vfat 支持 --offset"
+
+      - name: 源码缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gxm
+          key: gxm-src-${{ env.KC_LINUX }}-${{ env.MM_COMMIT }}-v1
+
+      - name: 拉取源码
+        run: |
+          set -euo pipefail
+          mkdir -p work ~/.cache/gxm
+          fetch() {
+            local url="$1" out="$2"
+            if [ -s "$out" ]; then echo "cached  $(basename "$out")"; return 0; fi
+            for m in "" "https://gh-proxy.com/"; do
+              if curl -fsSL --max-time 1500 -o "$out" "$m$url"; then echo "fetched $m"; return 0; fi
+            done
+            echo "::error::download failed: $url"; return 1
+          }
+          fetch "https://github.com/CoreELEC/linux-amlogic/archive/refs/heads/${KC_LINUX}.tar.gz" ~/.cache/gxm/kernel.tar.gz
+          fetch "https://github.com/CoreELEC/media_modules-aml/archive/${MM_COMMIT}.tar.gz" ~/.cache/gxm/mm.tar.gz
+          fetch "https://github.com/ophub/amlogic-s9xxx-armbian/raw/main/build-armbian/armbian-files/platform-files/amlogic/bootfs/u-boot.sd" ~/.cache/gxm/u-boot.sd
+          fetch "https://github.com/ophub/amlogic-s9xxx-armbian/raw/main/build-armbian/armbian-files/platform-files/amlogic/bootfs/aml_autoscript" ~/.cache/gxm/aml_autoscript
+          fetch "https://github.com/ophub/amlogic-s9xxx-armbian/raw/main/build-armbian/armbian-files/platform-files/amlogic/bootfs/s905_autoscript" ~/.cache/gxm/s905_autoscript
+          fetch "https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox-armv8l" ~/.cache/gxm/busybox
+          tar xzf ~/.cache/gxm/kernel.tar.gz -C work
+          tar xzf ~/.cache/gxm/mm.tar.gz -C work
+          chmod +x ~/.cache/gxm/busybox
+          ls -lh ~/.cache/gxm/
+          python3 -c "
+          d=open('${HOME}/.cache/gxm/u-boot.sd','rb').read()
+          print('u-boot 大小:', len(d), '| 首字节:', d[:4].hex())
+          assert b'U-Boot' in d, 'u-boot 里没有 U-Boot 串'
+          b=open('${HOME}/.cache/gxm/busybox','rb').read()
+          print('busybox 大小:', len(b), '| ELF64:', b[4]==2, '| AArch64:', int.from_bytes(b[18:20],'little')==183)
+          "
+
+      - name: 打补丁
+        run: |
+          set -euo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          MM="$(ls -d work/media_modules-aml-* | head -1)"
+          PATCHER="$(ls ci/apply_gxm_patches.py ce-gxm/patches/apply_gxm_patches.py apply_gxm_patches.py 2>/dev/null | head -1 || true)"
+          test -n "${PATCHER:-}" || { echo "::error::找不到 apply_gxm_patches.py"; exit 1; }
+          python3 "$PATCHER" "$KD" "$PWD/$MM"
+
+      - name: 编译内核（Image + Module.symvers）
+        run: |
+          set -uo pipefail
+          set +e
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- meson64_defconfig > /dev/null 2>&1
+          # phy_device.c 无条件调用 yt8511_config_out_125m()，该符号在 motorcomm.c
+          # 受 CONFIG_MOTORCOMM_PHY 门控。章鱼星球千兆口即 YT8511 类 PHY。
+          grep -q '^CONFIG_MOTORCOMM_PHY=' "$KD/.config" || echo 'CONFIG_MOTORCOMM_PHY=y' >> "$KD/.config"
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig > /dev/null 2>&1
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               HOSTCFLAGS="$HOSTFLAGS" -j"$(nproc)" Image modules > kernel_build.log 2>&1
+          rc=$?
+          echo "make 退出码: $rc"
+          if [ $rc -ne 0 ]; then
+            grep -E ' error: |Error [0-9]|undefined reference' kernel_build.log | head -20
+            tail -30 kernel_build.log
+            exit 1
+          fi
+          ls -lh "$KD/arch/arm64/boot/Image"
+          wc -l "$KD/Module.symvers"
+
+      - name: 编译私有 amcodec 模块
+        run: |
+          set -uo pipefail
+          set +e
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          MMABS="$PWD/$(ls -d work/media_modules-aml-* | head -1)"
+          # 必须一次性编整个 drivers/：frame_provider 与 stream_input 存在包内循环依赖
+          make -C "$KD" M="$MMABS/drivers" \
+               ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               KBUILD_EXTRA_SYMBOLS="$KD/Module.symvers" \
+               KCFLAGS="$KFLAGS" -k \
+               CONFIG_AMLOGIC_DVB=n \
+               CONFIG_AMLOGIC_MEDIA_VDEC_H264=m CONFIG_AMLOGIC_MEDIA_VDEC_H265=m \
+               CONFIG_AMLOGIC_MEDIA_VDEC_MPEG12=m CONFIG_AMLOGIC_MEDIA_VDEC_VP9=m \
+               > mod_build.log 2>&1
+          echo "make 退出码: $?"
+          echo "编译错误: $(grep -c ' error: ' mod_build.log)"
+          echo "未解析符号: $(grep -c 'undefined!' mod_build.log)"
+          grep 'undefined!' mod_build.log | head -10
+          echo "=== .ko ==="
+          find "$MMABS" -name '*.ko' | sed "s|$MMABS/drivers/||" | sort
+          test "$(find "$MMABS" -name '*.ko' | wc -l)" -ge 9 || { echo "::error::模块数量不足"; exit 1; }
+          grep -q 'undefined!' mod_build.log && { echo "::error::存在未解析符号"; exit 1; }
+          exit 0
+
+      - name: 生成 GXM 设备树
+        run: |
+          set -euo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          D="$KD/arch/arm64/boot/dts/amlogic"
+          cp "$D/gxl_p212_2g_buildroot.dts" "$D/gxm_q201_2g_buildroot.dts"
+          python3 - "$D/gxm_q201_2g_buildroot.dts" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          s = s.replace('amlogic-dt-id = "gxl_p212_2g"', 'amlogic-dt-id = "gxm_q201_2g"')
+          s = s.replace('compatible = "amlogic, Gxl"', 'compatible = "amlogic, Gxm"')
+          s = s.replace('gxl_p212_2g', 'gxm_q201_2g')
+          p.write_text(s)
+          print('[ok] dts 改写完成')
+          PY
+          grep -q gxm_q201_2g_buildroot.dtb "$D/Makefile" || \
+            echo 'dtb-$(CONFIG_ARM64) += gxm_q201_2g_buildroot.dtb' >> "$D/Makefile"
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               HOSTCFLAGS="$HOSTFLAGS" gxm_q201_2g_buildroot.dtb
+          ls -lh "$D/gxm_q201_2g_buildroot.dtb"
+          # 私有栈需要的节点必须都在
+          python3 - "$D/gxm_q201_2g_buildroot.dtb" <<'PY'
+          import sys, pathlib
+          d = pathlib.Path(sys.argv[1]).read_bytes()
+          need = [b"amlogic, vdec", b"amlogic, codec, streambuf", b"amlogic, codec, mm",
+                  b"amlogic, meson, canvas", b"amvideom", b"amhdmitx"]
+          missing = [n.decode() for n in need if n not in d]
+          print("节点缺失:", missing or "无")
+          assert not missing, "dtb 缺少私有栈节点"
+          PY
+
+      - name: 组装 initramfs
+        run: |
+          set -euo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          MMABS="$PWD/$(ls -d work/media_modules-aml-* | head -1)"
+          R="$PWD/initrd"
+          rm -rf "$R"; mkdir -p "$R"/{bin,sbin,proc,sys,dev,lib/modules,lib/firmware/video}
+          cp ~/.cache/gxm/busybox "$R/bin/busybox"
+          cp ~/.cache/gxm/busybox "$R/bin/sh"
+          chmod +x "$R/bin/busybox" "$R/bin/sh"
+          find "$MMABS" -name '*.ko' -exec cp {} "$R/lib/modules/" \;
+          cp "$MMABS/firmware/video_ucode.bin" "$R/lib/firmware/video/video_ucode.bin"
+          ls -lh "$R/lib/modules/" | tail -12
+
+          cat > "$R/init" <<'INIT'
+          #!/bin/sh
+          export PATH=/bin:/sbin
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs none /dev 2>/dev/null
+          /bin/busybox --install -s /bin 2>/dev/null
+          echo
+          echo "=================================================="
+          echo " GXM preflight  |  Octopus-Planet (S912)"
+          echo "=================================================="
+          cat /proc/version
+          echo "--- device-tree ---"
+          tr -d '\0' < /proc/device-tree/model 2>/dev/null; echo
+          tr -d '\0' < /proc/device-tree/compatible 2>/dev/null; echo
+          echo "--- smoke: /dev 挂载前存在的 amlogic 节点 ---"
+          ls /dev | grep -iE 'amstream|amvideo|amports|codec|vfm' || echo "  (此时还没有，正常)"
+          echo "--- 加载私有 amcodec 模块 ---"
+          for m in firmware media_clock decoder_common stream_input amvdec_h264 amvdec_h265 amvdec_mpeg12 amvdec_vp9 amvdec_ports; do
+            if insmod /lib/modules/$m.ko 2>/tmp/e; then
+              echo "  [OK]   $m"
+            else
+              echo "  [FAIL] $m : $(cat /tmp/e)"
+            fi
+          done
+          echo "--- lsmod ---"
+          lsmod
+          echo "--- /dev 下的 amlogic 节点 ---"
+          ls -l /dev/amstream* /dev/amvideo* /dev/amports* 2>/dev/null || echo "  (无)"
+          echo "--- /proc/misc ---"
+          cat /proc/misc
+          echo "--- dmesg 尾部 ---"
+          dmesg | tail -70
+          echo "=================================================="
+          echo " preflight 结束，15 秒后关机"
+          sleep 15
+          sync
+          echo o > /proc/sysrq-trigger
+          INIT
+          chmod +x "$R/init"
+          ( cd "$R" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 ) > initrd.img
+          ls -lh initrd.img
+
+      - name: 组装 SD 镜像
+        run: |
+          set -euo pipefail
+          IMG="gxm-preflight.img"
+          OFF="$PART_OFFSET"
+          rm -f "$IMG"
+          truncate -s "${IMG_MB}M" "$IMG"
+          END=$(( IMG_MB * 1024 * 1024 / 512 - 2048 ))
+          printf 'label: dos\nstart=%s, size=%s, type=c, bootable\n' "$OFF" "$END" | sfdisk -q "$IMG"
+          sfdisk -d "$IMG" | head -5
+
+          # 写 u-boot：保留 MBR 前 442 字节（446 起是分区表），其余从 sector 1 开始
+          dd if=~/.cache/gxm/u-boot.sd of="$IMG" bs=1 count=442 conv=notrunc status=none
+          dd if=~/.cache/gxm/u-boot.sd of="$IMG" bs=512 skip=1 seek=1 conv=notrunc status=none
+
+          LOOP="$(sudo losetup -fP --show "$IMG")"
+          echo "loop: $LOOP"
+          sudo mkfs.vfat -F 32 -n BOOT "${LOOP}p1"
+          sudo mkdir -p /mnt/gxm
+          sudo mount "${LOOP}p1" /mnt/gxm
+          sudo cp ~/.cache/gxm/aml_autoscript  /mnt/gxm/
+          sudo cp ~/.cache/gxm/s905_autoscript /mnt/gxm/
+          sudo cp work/linux-amlogic-*/arch/arm64/boot/Image /mnt/gxm/Image
+          sudo cp initrd.img /mnt/gxm/initrd.img
+          sudo mkdir -p /mnt/gxm/dtb
+          sudo cp work/linux-amlogic-*/arch/arm64/boot/dts/amlogic/gxm_q201_2g_buildroot.dtb \
+                  /mnt/gxm/dtb/meson-gxm-q201.dtb
+
+          # uEnv.txt：s905_autoscript 读它，再 booti
+          cat > /tmp/uEnv.txt <<'EOF'
+          LINUX=/Image
+          INITRD=/initrd.img
+          FDT=/dtb/meson-gxm-q201.dtb
+          APPEND=console=ttyAML0,115200n8 console=tty0 rdinit=/init loglevel=8 no_console_suspend earlycon=aml-uart,0xc81004c0
+          EOF
+          sudo cp /tmp/uEnv.txt /mnt/gxm/uEnv.txt
+
+          echo "=== 分区内容 ==="
+          sudo ls -lh /mnt/gxm /mnt/gxm/dtb
+          sync
+          sudo umount /mnt/gxm
+          sudo losetup -d "$LOOP"
+          xz -T0 -9 -c "$IMG" > gxm-preflight.img.xz
+          ls -lh "$IMG" gxm-preflight.img.xz
+
+      - name: 校验镜像结构
+        run: |
+          set -euo pipefail
+          IMG="gxm-preflight.img"
+          LOOP="$(sudo losetup -fP --show "$IMG")"
+          echo "=== 分区表 ==="
+          sudo partx -s "$LOOP" || true
+          echo "=== MBR 完整性（442-511 字节应保留分区表） ==="
+          sudo dd if="$LOOP" bs=1 skip=446 count=64 status=none | od -An -tx1
+          sudo mkdir -p /mnt/chk
+          sudo mount -o ro "${LOOP}p1" /mnt/chk
+          echo "=== FAT 内容 ==="
+          sudo find /mnt/chk -maxdepth 2 -type f -printf '  %-32p %10s\n' | sort
+          echo "=== 关键文件非空校验 ==="
+          for f in Image initrd.img dtb/meson-gxm-q201.dtb uEnv.txt aml_autoscript s905_autoscript; do
+            s=$(sudo stat -c %s "/mnt/chk/$f")
+            if [ "$s" -gt 0 ]; then echo "  [OK]   $f ($s B)"; else echo "  [FAIL] $f 为空"; exit 1; fi
+          done
+          echo "=== uEnv.txt ==="
+          sudo cat /mnt/chk/uEnv.txt
+          sudo umount /mnt/chk
+          sudo losetup -d "$LOOP"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gxm-preflight-image
+          path: |
+            gxm-preflight.img.xz
+            initrd.img
+            mod_build.log
+            kernel_build.log
+          compression-level: 0
+          if-no-files-found: warn
