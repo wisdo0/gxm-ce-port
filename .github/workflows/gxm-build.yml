@@ -114,9 +114,19 @@ jobs:
           KD="$PWD/work/linux-amlogic-${KC_LINUX}"
           D="$KD/arch/arm64/boot/dts/amlogic"
           cp "$D/gxl_p212_2g_buildroot.dts" "$D/gxm_q201_2g_buildroot.dts"
-          sed -i 's/amlogic-dt-id = "gxl_p212_2g"/amlogic-dt-id = "gxm_q201_2g"/; \
-                  s/compatible = "amlogic, Gxl"/compatible = "amlogic, Gxm"/; \
-                  s/gxl_p212_2g/gxm_q201_2g/g' "$D/gxm_q201_2g_buildroot.dts"
+          # 用 Python 改写，避免 sed 里反斜杠续行 + 双引号嵌套的转义问题
+          python3 - "$D/gxm_q201_2g_buildroot.dts" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          s = s.replace('amlogic-dt-id = "gxl_p212_2g"',
+                        'amlogic-dt-id = "gxm_q201_2g"')
+          s = s.replace('compatible = "amlogic, Gxl"',
+                        'compatible = "amlogic, Gxm"')
+          s = s.replace('gxl_p212_2g', 'gxm_q201_2g')
+          p.write_text(s)
+          print('[ok] dts 改写完成，gxm 出现 %d 次' % s.count('gxm'))
+          PY
           grep -q gxm_q201_2g_buildroot.dtb "$D/Makefile" || \
             echo 'dtb-$(CONFIG_ARM64) += gxm_q201_2g_buildroot.dtb' >> "$D/Makefile"
           make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- gxm_q201_2g_buildroot.dtb
@@ -154,6 +164,15 @@ jobs:
             echo "总错误数: **$total**"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "ko_count=$(find "$PWD/$MM" -name '*.ko' | wc -l)" >> "$GITHUB_OUTPUT"
+          # 有错误就让任务红，避免"绿色但实际没编出来"
+          if [ "$total" -gt 0 ]; then
+            echo "::error::媒体模块编译有 $total 条错误，详见 artifact 日志"
+            exit 1
+          fi
+          if [ "$(find "$PWD/$MM" -name '*.ko' | wc -l)" -eq 0 ]; then
+            echo "::error::没有任何 .ko 产出，编译很可能未真正执行"
+            exit 1
+          fi
 
       - name: 失败时上传日志
         if: failure()
