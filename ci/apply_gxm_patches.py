@@ -13,12 +13,18 @@ GXM 移植补丁集 —— 让 CE 9.2 时代的 media_modules 供体（1af2bb1�
 用法（在内核树根目录执行，幂等）：
     python3 apply_gxm_patches.py /path/to/linux-amlogic-4.9-20 /path/to/media_modules-aml
 
-改动共 5 处，全部是最小侵入：
+改动共 6 处，全部是最小侵入：
   1. struct vframe_s        + atomic_t use_cnt                (29 处报错)
   2. struct file_private_data + ulong v4l_dev_handle/inst     (4 处报错)
   3. codec_mm.h             + 2 个 5 参兼容壳                  (4 处报错)
   4. aml_vcodec_util.c      + vdec.c 改指兼容壳                (3 处调用)
-  5. 编译参数                -Wno-incompatible-pointer-types    (GCC14 把该警告升成错误)
+  5. aml_demod_common.h     + aml_tuner.i2c_adp 与 2 个枚举值  (dvb_common.c 5 处)
+  6. 编译参数                -Wno-incompatible-pointer-types    (GCC14 把该警告升成错误)
+
+DVB 说明：stream_input 里 hw_demux/demux/dvb_ci 三个目录用
+  obj-$(CONFIG_AMLOGIC_DVB) 门控；在外部模块构建中该宏未定义会退化成
+  obj-y（不是 obj-n），所以必须在 make 命令行显式传 CONFIG_AMLOGIC_DVB=n。
+  dvb_common.c 是无条件编入 stream_input-objs 的，故仍需第 5 处补丁。
 """
 import pathlib
 import sys
@@ -33,6 +39,19 @@ KERNEL_FIELDS = [
      "\tulong vb_handle;\n\tulong v4l_dec_ctx;\n",
      "\tulong vb_handle;\n\tulong v4l_dev_handle;\n\tulong v4l_inst_handle;\n\tulong v4l_dec_ctx;\n",
      "file_private_data 两个 handle"),
+    # 以下两处只为 dvb_common.c（它无条件编进 stream_input.o）。
+    # 章鱼星球没有 DVB 硬件，这两个补丁只求编过，不参与运行。
+    ("include/linux/amlogic/aml_demod_common.h",
+     "\tunsigned int i2c_adapter_id;\n};\n",
+     "\tunsigned int i2c_adapter_id;\n"
+     "\tstruct i2c_adapter *i2c_adp;\t/* GXM port: 供体模块用此成员 */\n};\n",
+     "aml_tuner.i2c_adp"),
+    ("include/linux/amlogic/aml_demod_common.h",
+     "\tAM_DTV_DEMOD_AVL6221C = 28\n};",
+     "\tAM_DTV_DEMOD_AVL6221C = 28,\n"
+     "\tAM_DTV_DEMOD_AML      = 29,\n"
+     "\tAM_DTV_DEMOD_SI2168_1 = 30\n};",
+     "dtv_demod_type.AM_DTV_DEMOD_SI2168_1"),
 ]
 
 SHIMS = """
@@ -123,8 +142,11 @@ def main():
       CROSS_COMPILE=aarch64-linux-gnu- -k \\
       KCFLAGS="-Wno-error -Wno-incompatible-pointer-types -Wno-int-conversion" \\
       CONFIG_AMLOGIC_MEDIA_VDEC_H264=m CONFIG_AMLOGIC_MEDIA_VDEC_H265=m \\
+      CONFIG_AMLOGIC_DVB=n \
+      CONFIG_AMLOGIC_MEDIA_VDEC_H264=m CONFIG_AMLOGIC_MEDIA_VDEC_H265=m \
       CONFIG_AMLOGIC_MEDIA_VDEC_MPEG12=m CONFIG_AMLOGIC_MEDIA_VDEC_VP9=m
   done
+  # CONFIG_AMLOGIC_DVB=n 是必需的：该宏未定义时 obj-$(...) 会变成 obj-y
 """)
     return 0
 

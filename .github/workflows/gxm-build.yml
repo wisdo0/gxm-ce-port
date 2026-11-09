@@ -142,12 +142,14 @@ jobs:
           KD="$PWD/work/linux-amlogic-${KC_LINUX}"
           MM="$(ls -d work/media_modules-aml-* | head -1)"
           total=0
-          # 不传 CONFIG_AMLOGIC_DVB：DVB 子目录自动跳过；
-          # 但 stream_input 里的 amstream / esparser / tsdemux 仍会编（播放必需）
+          # 必须显式关 DVB：obj-$(CONFIG_AMLOGIC_DVB) 在宏未定义时会退化成 obj-y，
+          # 导致 hw_demux/demux/dvb_ci 三个目录照样被编译（36 条报错）。
+          # stream_input 里的 amstream / esparser / tsdemux 不受影响，播放必需。
           for d in common frame_provider frame_sink amvdec_ports stream_input; do
             make -C "$KD" M="$PWD/$MM/drivers/$d" \
                  ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                  KCFLAGS="$KFLAGS" -k \
+                 CONFIG_AMLOGIC_DVB=n \
                  CONFIG_AMLOGIC_MEDIA_VDEC_H264=m CONFIG_AMLOGIC_MEDIA_VDEC_H265=m \
                  CONFIG_AMLOGIC_MEDIA_VDEC_MPEG12=m CONFIG_AMLOGIC_MEDIA_VDEC_VP9=m \
                  > "mk_$d.log" 2>&1
