@@ -1,0 +1,206 @@
+name: gxm-kernel
+
+# 私有 amcodec 的加载前提验证。
+#
+# 为什么需要这个：gxm-build 只做过 modules_prepare，没有 vmlinux，
+# 所以 Module.symvers 是空的 —— 那时 modpost 无法判定 .ko 引用的
+# codec_mm_* / vfq_* / amvideo / canvas 等符号能否被内核解析。
+# 上机 insmod 时若符号缺失，表现就是 "Unknown symbol in module"，
+# 而这类问题在 CI 阶段是完全可以提前发现的。
+#
+# 本工作流做三件事：
+#   1. 全量编内核（Image + 树内 modules）→ 产出 Module.symvers
+#   2. 用该符号表编外部模块（KBUILD_EXTRA_SYMBOLS）
+#   3. 统计 modpost 的 "undefined!" 警告数，作为放行判据
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "gxm-v*"
+
+permissions:
+  contents: write
+
+env:
+  KC_LINUX: amlogic-4.9-20
+  MM_COMMIT: 1af2bb1308f07e060f588761b3ee60398675f5c4
+  HOSTFLAGS: "-fcommon -Wno-error"
+  KFLAGS: "-Wno-error -Wno-incompatible-pointer-types -Wno-int-conversion"
+
+jobs:
+  symcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout 本仓库（取补丁脚本）
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo docker image prune -af || true
+          df -h / | tail -1
+
+      - name: 安装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc bison flex \
+            libssl-dev libncurses-dev unzip mtools device-tree-compiler \
+            rsync xz-utils gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          echo "核数: $(nproc)"
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: 源码缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gxm
+          # 与 gxm-build 用同一个 key，可直接命中已有缓存
+          key: gxm-src-${{ env.KC_LINUX }}-${{ env.MM_COMMIT }}-v1
+
+      - name: 拉取源码
+        run: |
+          set -euo pipefail
+          mkdir -p work ~/.cache/gxm
+          fetch() {
+            local url="$1" out="$2"
+            if [ -s "$out" ]; then echo "cached  $(basename "$out")"; return 0; fi
+            for m in "" "https://gh-proxy.com/"; do
+              if curl -fsSL --max-time 1500 -o "$out" "$m$url"; then echo "fetched $m"; return 0; fi
+            done
+            echo "::error::download failed: $url"; return 1
+          }
+          fetch "https://github.com/CoreELEC/linux-amlogic/archive/refs/heads/${KC_LINUX}.tar.gz" ~/.cache/gxm/kernel.tar.gz
+          fetch "https://github.com/CoreELEC/media_modules-aml/archive/${MM_COMMIT}.tar.gz" ~/.cache/gxm/mm.tar.gz
+          tar xzf ~/.cache/gxm/kernel.tar.gz -C work
+          tar xzf ~/.cache/gxm/mm.tar.gz -C work
+          ls -d work/*/
+          test -d "work/linux-amlogic-${KC_LINUX}"
+
+      - name: 打补丁
+        run: |
+          set -euo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          MM="$(ls -d work/media_modules-aml-* | head -1)"
+          PATCHER="$(ls ce-gxm/patches/apply_gxm_patches.py ci/apply_gxm_patches.py \
+                        apply_gxm_patches.py 2>/dev/null | head -1 || true)"
+          if [ -z "${PATCHER:-}" ]; then
+            echo "::error::找不到 apply_gxm_patches.py"
+            exit 1
+          fi
+          python3 "$PATCHER" "$KD" "$PWD/$MM"
+
+      - name: 全量编译内核
+        id: kernel
+        run: |
+          set -uo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               meson64_defconfig > /dev/null 2>&1
+          # 关键：必须编出 vmlinux + 跑过 modpost，Module.symvers 才非空
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               HOSTCFLAGS="$HOSTFLAGS" -j"$(nproc)" Image modules \
+               > kernel_build.log 2>&1
+          rc=$?
+          echo "make 退出码: $rc"
+          if [ $rc -ne 0 ]; then
+            echo "=== 失败尾部 ==="
+            grep -E ' error: |Error [0-9]|No rule' kernel_build.log | head -25
+            tail -40 kernel_build.log
+            exit 1
+          fi
+          ls -lh "$KD/arch/arm64/boot/Image"
+          echo "=== Module.symvers ==="
+          if [ -s "$KD/Module.symvers" ]; then
+            wc -l "$KD/Module.symvers"
+          else
+            echo "::error::Module.symvers 为空，内核未真正编完"
+            exit 1
+          fi
+          # 私有 amcodec 依赖的内核符号是否真的导出了
+          echo "=== 关键符号导出检查 ==="
+          for s in codec_mm_dma_alloc_coherent vfq_create vfq_get canvas_pool_alloc mailbox_get_platform_info; do
+            if awk -v s="$s" '$2==s {found=1} END {exit !found}' "$KD/Module.symvers"; then
+              echo "  [导出] $s"
+            else
+              echo "  [缺失] $s"
+            fi
+          done
+
+      - name: 用符号表编外部模块
+        id: extmod
+        run: |
+          set -uo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          MM="$(ls -d work/media_modules-aml-* | head -1)"
+          for d in common frame_provider frame_sink amvdec_ports stream_input; do
+            make -C "$KD" M="$PWD/$MM/drivers/$d" \
+                 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+                 KBUILD_EXTRA_SYMBOLS="$KD/Module.symvers" \
+                 KCFLAGS="$KFLAGS" -k \
+                 CONFIG_AMLOGIC_DVB=n \
+                 CONFIG_AMLOGIC_MEDIA_VDEC_H264=m CONFIG_AMLOGIC_MEDIA_VDEC_H265=m \
+                 CONFIG_AMLOGIC_MEDIA_VDEC_MPEG12=m CONFIG_AMLOGIC_MEDIA_VDEC_VP9=m \
+                 > "sym_$d.log" 2>&1
+            echo "[$d] exit=$? errors=$(grep -c ' error: ' "sym_$d.log" || true)"
+          done
+          echo "=== .ko ==="
+          find "$PWD/$MM" -name '*.ko' | sed "s|$PWD/||"
+
+      - name: 符号解析判定
+        run: |
+          set -uo pipefail
+          cat sym_*.log > sym_all.log 2>/dev/null || true
+          und=$(grep -c 'undefined!' sym_all.log || true)
+          err=$(grep -c ' error: ' sym_all.log || true)
+          ko=$(find work -name '*.ko' | wc -l)
+          echo "未解析符号(undefined!): $und"
+          echo "编译错误: $err"
+          echo ".ko 数量: $ko"
+          if [ "$und" -gt 0 ]; then
+            echo "=== 缺失符号明细 ==="
+            grep 'undefined!' sym_all.log | sed 's/.*WARNING: //' | sort -u | head -40
+          fi
+          {
+            echo "## 私有 amcodec 符号验证"
+            echo ""
+            echo "| 指标 | 值 |"
+            echo "|---|---|"
+            echo "| 未解析符号 | **$und** |"
+            echo "| 编译错误 | $err |"
+            echo "| .ko 数量 | $ko |"
+            echo ""
+            if [ "$und" -gt 0 ]; then
+              echo "### 缺失符号"
+              echo '```'
+              grep 'undefined!' sym_all.log | sed 's/.*WARNING: //' | sort -u | head -40
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$err" -gt 0 ] || [ "$ko" -eq 0 ]; then
+            echo "::error::编译失败或没有产出 .ko"
+            exit 1
+          fi
+          if [ "$und" -gt 0 ]; then
+            echo "::error::有 $und 个符号无法解析，上机会 Unknown symbol"
+            exit 1
+          fi
+          echo "符号全部解析，可以进入镜像阶段"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gxm-symcheck
+          path: |
+            work/**/*.ko
+            work/linux-amlogic-*/arch/arm64/boot/Image
+            work/linux-amlogic-*/Module.symvers
+            sym_*.log
+            kernel_build.log
+          compression-level: 0
+          if-no-files-found: warn
