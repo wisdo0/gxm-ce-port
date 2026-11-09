@@ -106,3 +106,38 @@ vmlinux 链接失败。章鱼星球千兆口即此类 PHY，功能上也需要�
 
 `codec_mm_dma_free_coherent_compat` 当前是**空实现**（只为过编译）。上机前必须改成
 `alloc` 返回 handle、`free` 用同一 handle 的配对管理，否则每播一次泄漏一块显存。
+
+## 骨架镜像 `gxm-preflight.img`（真机验证模块 probe）
+
+目的：不付 Kodi 6–10 小时的编译代价，先回答"9 个 `.ko` 能不能 probe"。
+
+| 项 | 值 |
+|---|---|
+| 镜像 | 256 MB（xz 后 14 MB），工作流 `gxm-image` |
+| 引导 | 厂商 u-boot 2015.01（含 BL1/BL2/BL30）→ `aml_autoscript` → `s905_autoscript` → `uEnv.txt` → `booti` |
+| 根文件系统 | initramfs（无 rootfs 分区），内含 9 个 `.ko` + `/lib/firmware/video/video_ucode.bin` + busybox |
+| 引导分区 | FAT32，`aml_autoscript` `s905_autoscript` `uEnv.txt` `Image` `initrd.img` `dtb/meson-gxm-q201.dtb` |
+
+### 怎么烧
+
+```bash
+# Linux / macOS（确认是 SD 卡，别写错盘）
+xz -dc gxm-preflight.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+```
+
+Windows 用 balenaEtcher 或 Rufus（DD 模式）直接写 `.img`（先解压）。
+
+### 开机后看什么
+
+串口 `ttyAML0`（115200 8N1）或 HDMI 控制台。**第一次启动会重启一到两次**（`aml_autoscript`
+要 `saveenv` + `reboot`），属正常。
+
+成功判据是看到：
+
+```
+[OK]   firmware      ... [OK]   amvdec_ports
+--- /dev 下的 amlogic 节点 ---
+crw------- 1 root root  <maj>,<min>  /dev/amstream_vbuf
+```
+
+任何 `[FAIL]` 都会带 `insmod` 的错误原因；那就是下一步要修的地方。
