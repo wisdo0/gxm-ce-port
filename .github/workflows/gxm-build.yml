@@ -1,0 +1,196 @@
+name: gxm-build
+
+# 产出 GXM(S912/章鱼星球) 在 CoreELEC 21 内核（amlogic-4.9-20）上的构建物：
+#   - gxm_q201_2g_buildroot.dtb        （机型设备树）
+#   - amvdec_*.ko / amvdec_ports.ko ...（GX 单路解码器 + amstream）
+#
+# 为什么搬到 CI：Colab 免费实例闲置 2–4h 即回收，且实测出现过
+#   RuntimeError: Connection was lost，验证流程无法稳定跑完。
+#
+# 流程：拉内核与 media_modules → modules_prepare → 打补丁 → 编 dtb 与解码器 → 汇总/上传。
+# 补丁见 ci/apply_gxm_patches.py（5 处最小侵入，与 Colab 上验证过的一致）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_engines:
+        description: "编译 media_modules（解码器 + stream_input）"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "gxm-v*"
+
+permissions:
+  contents: write
+
+env:
+  KC_LINUX: amlogic-4.9-20
+  MM_COMMIT: 1af2bb1308f07e060f588761b3ee60398675f5c4
+  # 老内核(4.9)配新 bison：dtc 会报 yylloc 多重定义，必须 -fcommon
+  HOSTFLAGS: "-fcommon -Wno-error"
+  # GCC13+ 把 incompatible-pointer-types 等升成硬错误
+  KFLAGS: "-Wno-error -Wno-incompatible-pointer-types -Wno-int-conversion"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      ko_count: ${{ steps.modules.outputs.ko_count }}
+
+    steps:
+      - name: Checkout 本仓库（取补丁脚本）
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo docker image prune -af || true
+          df -h / | tail -1
+
+      - name: 安装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc bison flex \
+            libssl-dev libncurses-dev unzip mtools device-tree-compiler \
+            rsync xz-utils gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: 源码缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gxm
+          key: gxm-src-${{ env.KC_LINUX }}-${{ env.MM_COMMIT }}-v1
+
+      - name: 拉取源码
+        run: |
+          set -euo pipefail
+          mkdir -p work ~/.cache/gxm
+          fetch() {
+            local url="$1" out="$2"
+            if [ -s "$out" ]; then echo "cached  $(basename "$out")"; return 0; fi
+            for m in "" "https://gh-proxy.com/"; do
+              if curl -fsSL --max-time 1500 -o "$out" "$m$url"; then echo "fetched $m"; return 0; fi
+            done
+            echo "::error::download failed: $url"; return 1
+          }
+          fetch "https://github.com/CoreELEC/linux-amlogic/archive/refs/heads/${KC_LINUX}.tar.gz" ~/.cache/gxm/kernel.tar.gz
+          fetch "https://github.com/CoreELEC/media_modules-aml/archive/${MM_COMMIT}.tar.gz" ~/.cache/gxm/mm.tar.gz
+          tar xzf ~/.cache/gxm/kernel.tar.gz -C work
+          tar xzf ~/.cache/gxm/mm.tar.gz -C work
+          ls -d work/*/
+          test -d "work/linux-amlogic-${KC_LINUX}"
+
+      - name: 内核准备
+        run: |
+          set -euo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- meson64_defconfig >/dev/null
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               HOSTCFLAGS="$HOSTFLAGS" modules_prepare -j"$(nproc)"
+          ls -l "$KD/include/generated/bounds.h"
+
+      - name: 打补丁
+        run: |
+          set -euo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          MM="$(ls -d work/media_modules-aml-* | head -1)"
+          PATCHER="$(ls ce-gxm/patches/apply_gxm_patches.py ci/apply_gxm_patches.py \
+                        apply_gxm_patches.py 2>/dev/null | head -1 || true)"
+          if [ -z "${PATCHER:-}" ]; then
+            echo "::error::找不到 apply_gxm_patches.py，请确认仓库结构"
+            exit 1
+          fi
+          echo "patcher: $PATCHER"
+          python3 "$PATCHER" "$KD" "$PWD/$MM"
+
+      - name: 编译 GXM dtb
+        run: |
+          set -euo pipefail
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          D="$KD/arch/arm64/boot/dts/amlogic"
+          cp "$D/gxl_p212_2g_buildroot.dts" "$D/gxm_q201_2g_buildroot.dts"
+          sed -i 's/amlogic-dt-id = "gxl_p212_2g"/amlogic-dt-id = "gxm_q201_2g"/; \
+                  s/compatible = "amlogic, Gxl"/compatible = "amlogic, Gxm"/; \
+                  s/gxl_p212_2g/gxm_q201_2g/g' "$D/gxm_q201_2g_buildroot.dts"
+          grep -q gxm_q201_2g_buildroot.dtb "$D/Makefile" || \
+            echo 'dtb-$(CONFIG_ARM64) += gxm_q201_2g_buildroot.dtb' >> "$D/Makefile"
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- gxm_q201_2g_buildroot.dtb
+          mkdir -p out
+          cp "$D/gxm_q201_2g_buildroot.dtb" out/
+          ls -lh out/
+
+      - name: 编译媒体模块
+        id: modules
+        if: ${{ inputs.build_engines }}
+        run: |
+          set +e
+          KD="$PWD/work/linux-amlogic-${KC_LINUX}"
+          MM="$(ls -d work/media_modules-aml-* | head -1)"
+          total=0
+          # 不传 CONFIG_AMLOGIC_DVB：DVB 子目录自动跳过；
+          # 但 stream_input 里的 amstream / esparser / tsdemux 仍会编（播放必需）
+          for d in common frame_provider frame_sink amvdec_ports stream_input; do
+            make -C "$KD" M="$PWD/$MM/drivers/$d" \
+                 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+                 KCFLAGS="$KFLAGS" -k \
+                 CONFIG_AMLOGIC_MEDIA_VDEC_H264=m CONFIG_AMLOGIC_MEDIA_VDEC_H265=m \
+                 CONFIG_AMLOGIC_MEDIA_VDEC_MPEG12=m CONFIG_AMLOGIC_MEDIA_VDEC_VP9=m \
+                 > "mk_$d.log" 2>&1
+            n=$(grep -c ' error: ' "mk_$d.log" || true)
+            total=$((total + n))
+            echo "[$d] errors=$n"
+          done
+          echo "总错误数: $total"
+          {
+            echo "## GXM 构建"
+            echo ""
+            for f in mk_*.log; do echo "- $f: $(grep -c ' error: ' "$f" || true) errors"; done
+            echo ""
+            echo "总错误数: **$total**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ko_count=$(find "$PWD/$MM" -name '*.ko' | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: 失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gxm-logs
+          path: mk_*.log
+          if-no-files-found: warn
+
+      - name: 汇总产物
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find work -name '*.ko' -exec cp {} out/ \; 2>/dev/null || true
+          ls -lh out/
+          {
+            echo ""
+            echo "### 产物"
+            ls out/ | sed 's/^/  /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传构建物
+        uses: actions/upload-artifact@v4
+        with:
+          name: gxm-artifacts
+          path: |
+            out/*.dtb
+            out/*.ko
+            mk_*.log
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: 发布 Release（仅推 gxm-v* tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.dtb
+            out/*.ko
+          generate_release_notes: true

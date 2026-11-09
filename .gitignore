@@ -1,0 +1,5 @@
+.DS_Store
+work/
+out/
+*.log
+__pycache__/
