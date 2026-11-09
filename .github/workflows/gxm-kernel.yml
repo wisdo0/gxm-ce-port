@@ -98,9 +98,20 @@ jobs:
         id: kernel
         run: |
           set -uo pipefail
+          set +e          # GitHub 的 shell 带 -e，这里必须显式关掉，否则失败时下面诊断不执行
           KD="$PWD/work/linux-amlogic-${KC_LINUX}"
           make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                meson64_defconfig > /dev/null 2>&1
+          # meson64_defconfig 没开 MOTORCOMM_PHY，但 phy_device.c 无条件调用
+          # yt8511_config_out_125m()（识别到 PHY ID 0x4f51e91b 即 YT8511 时），
+          # 不开就 vmlinux 链接失败：undefined reference。
+          # 章鱼星球千兆口正是这类 PHY，功能上也需要。
+          if ! grep -q '^CONFIG_MOTORCOMM_PHY=' "$KD/.config"; then
+            echo 'CONFIG_MOTORCOMM_PHY=y' >> "$KD/.config"
+            echo "已追加 CONFIG_MOTORCOMM_PHY=y 并重算配置"
+          fi
+          make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig > /dev/null 2>&1
+          grep -E '^CONFIG_(MOTORCOMM_PHY|AMLOGIC_MEDIA_VIDEO|AMLOGIC_MEDIA_VFM|AMLOGIC_MEDIA_CODEC_MM)=' "$KD/.config"
           # 关键：必须编出 vmlinux + 跑过 modpost，Module.symvers 才非空
           make -C "$KD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                HOSTCFLAGS="$HOSTFLAGS" -j"$(nproc)" Image modules \
@@ -135,6 +146,7 @@ jobs:
         id: extmod
         run: |
           set -uo pipefail
+          set +e          # 5 个目录都要尝试，失败也要留下日志
           KD="$PWD/work/linux-amlogic-${KC_LINUX}"
           MM="$(ls -d work/media_modules-aml-* | head -1)"
           for d in common frame_provider frame_sink amvdec_ports stream_input; do
